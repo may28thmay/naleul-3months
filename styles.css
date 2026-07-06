@@ -54,6 +54,8 @@ main{max-width:720px; margin:0 auto; padding:28px 20px 80px}
 .pubflag.off{background:#ece8e0; color:#a59c8c}
 .reset{text-align:center; margin-top:30px}
 .reset button{background:none; border:none; color:#b9b2a4; font-size:12px; cursor:pointer; text-decoration:underline}
+.warnband{margin-top:26px; padding:12px 16px; background:#fdf6e3; border:1px solid #ecd9a0; border-radius:12px; font-size:13px; color:#8a6d3b; text-align:center; line-height:1.6}
+.warnband + .backup{margin-top:10px}
 
 /* 스텝 */
 .crumbs{font-size:13px; color:var(--muted); margin-bottom:10px}

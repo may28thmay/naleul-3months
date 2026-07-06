@@ -12,15 +12,22 @@
     try { return JSON.parse(localStorage.getItem(KEY)) || { a: {} }; }
     catch (e) { return { a: {} }; }
   }
-  function save() {
+  var saveTimer = null, suspendSave = false; // suspendSave: 초기화/가져오기 직후 이전 상태가 다시 저장되는 걸 막음
+  function doSave() {
+    if (suspendSave) return;
     try { localStorage.setItem(KEY, JSON.stringify(state)); }
     catch (e) {
-      if (!save._warned) {
-        save._warned = true;
+      if (!doSave._warned) {
+        doSave._warned = true;
         setTimeout(function () { alert("저장 공간이 가득 찼거나 브라우저가 저장을 막고 있어요. '내 기록 백업하기'로 파일을 받아두세요."); }, 0);
       }
     }
   }
+  function save() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(doSave, 200);
+  }
+  window.addEventListener("pagehide", doSave);
 
   function esc(s) {
     return (s == null ? "" : String(s)).replace(/[&<>"]/g, function (c) {
@@ -28,6 +35,8 @@
     });
   }
   function nl2br(s) { return esc(s).replace(/\n/g, "<br>"); }
+  /* 인라인 핸들러의 JS 문자열 인자용 — 이스케이프가 런타임에 원래 문자로 복원되므로 값이 보존된다 */
+  function jstr(s) { return esc(String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'")); }
   function getWeek(id) { return COURSE.weeks.filter(function (w) { return w.id === id; })[0]; }
   /* ---------- 공개 게이팅 / 관리자 ---------- */
   var ADMIN_HASH = "admin-najung";   // 비밀 진입 주소: .../#admin-najung (한 번 들어오면 이 기기에 기억)
@@ -43,7 +52,7 @@
   window.setText = function (id, v) { A[id] = v; save(); };
   function listData(id) { if (!Array.isArray(A[id])) A[id] = []; return A[id]; }
   window.setListItem = function (id, i, v) { var a = listData(id); a[i] = v; save(); };
-  window.addListRow = function (id) { listData(id).push(""); save(); renderStep(); };
+  window.addListRow = function (id) { listData(id).push(""); save(); renderStep(true); };
 
   function choice(id) {
     if (!A[id]) A[id] = { picked: [], other: "" };
@@ -133,11 +142,18 @@
     var r = document.getElementById("radar"); if (r) r.innerHTML = radarInner(items, sl(id));
   };
 
-  window.setLog = function (id, i, key, v) { A[id][i][key] = v; save(); };
+  window.setLog = function (id, i, key, v) {
+    var arr = A[id]; if (!Array.isArray(arr)) return;
+    var row = arr[i] || (arr[i] = {});
+    row[key] = v; save();
+  };
 
   window.resetAll = function () {
-    if (confirm("지금까지 쓴 내용을 모두 지울까요? 되돌릴 수 없어요.")) {
-      localStorage.removeItem(KEY); location.hash = "#home"; location.reload();
+    if (confirm("지금까지 쓴 내용을 모두 지울까요? 되돌릴 수 없어요.\n(지우기 전에 백업 파일을 자동으로 한 번 내려받아요)")) {
+      if (Object.keys(A).length) exportData();
+      suspendSave = true; clearTimeout(saveTimer);
+      localStorage.removeItem(KEY);
+      setTimeout(function () { location.hash = "#home"; location.reload(); }, 400);
     }
   };
 
@@ -153,8 +169,42 @@
       a.href = url; a.download = name; document.body.appendChild(a); a.click();
       document.body.removeChild(a);
       setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      state.backupAt = new Date().toISOString(); save();
     } catch (e) { alert("백업에 실패했어요. 잠시 후 다시 시도해 주세요."); }
   };
+
+  /* 가져온 백업 정리 — 함수 등 이상 타입 제거, text류는 문자열 강제(오염 파일이 렌더를 깨지 않게) */
+  function deepClean(v, depth) {
+    if (depth > 6) return undefined;
+    var t = typeof v;
+    if (t === "string" || t === "number" || t === "boolean") return v;
+    if (Array.isArray(v)) {
+      var arr = [];
+      for (var i = 0; i < v.length; i++) { var c = deepClean(v[i], depth + 1); arr.push(c === undefined ? "" : c); }
+      return arr;
+    }
+    if (v && t === "object") {
+      var o = {};
+      Object.keys(v).forEach(function (k) { var c = deepClean(v[k], depth + 1); if (c !== undefined) o[k] = c; });
+      return o;
+    }
+    return undefined;
+  }
+  function sanitizeAnswers(ans) {
+    var textIds = {};
+    COURSE.weeks.forEach(function (w) {
+      w.steps.forEach(function (s) { if (s.id && (s.type === "text" || s.type === "manifest")) textIds[s.id] = 1; });
+    });
+    var out = {};
+    Object.keys(ans).forEach(function (k) {
+      var v = ans[k];
+      if (textIds[k]) { if (typeof v === "string") out[k] = v; return; }
+      var c = deepClean(v, 0);
+      if (c !== undefined) out[k] = c;
+    });
+    return out;
+  }
+
   window.importData = function (input) {
     var file = input.files && input.files[0];
     if (!file) return;
@@ -165,7 +215,9 @@
         var ans = obj && obj.a;
         if (!ans || typeof ans !== "object" || Array.isArray(ans)) throw new Error("형식");
         if (!confirm("지금 이 기기의 기록을 백업 파일 내용으로 바꿔요. 계속할까요?")) { input.value = ""; return; }
-        localStorage.setItem(KEY, JSON.stringify({ a: ans }));
+        var clean = sanitizeAnswers(ans);
+        suspendSave = true; clearTimeout(saveTimer);
+        localStorage.setItem(KEY, JSON.stringify({ a: clean, backupAt: new Date().toISOString() }));
         location.hash = "#home"; location.reload();
       } catch (err) {
         alert("이 파일은 백업 파일이 아닌 것 같아요. '내 기록 백업하기'로 받은 .json 파일을 골라주세요.");
@@ -179,7 +231,7 @@
   function hasAns(s) {
     var v = A[s.id];
     switch (s.type) {
-      case "text": return !!(v && v.trim());
+      case "text": return !!(typeof v === "string" && v.trim());
       case "list": return !!(Array.isArray(v) && v.some(function (x) { return x && String(x).trim(); }));
       case "promptForge": if (!s.reframeId) return false; var r = A[s.reframeId]; return !!(r && Object.keys(r).some(function (k) { return r[k] && String(r[k]).trim(); }));
       case "choices": return !!(v && ((v.picked && v.picked.length) || (v.other && v.other.trim())));
@@ -191,13 +243,13 @@
       case "sliders": return !!(v && Object.keys(v).length);
       case "assess": return !!(v && Object.keys(v).length);
       case "big5": return !!(v && v.domains && Object.keys(v.domains).length);
-      case "dailyLog": return !!(v && v.some(function (d) { return Object.keys(d).some(function (k) { return d[k] && String(d[k]).trim(); }); }));
+      case "dailyLog": return !!(Array.isArray(v) && v.some(function (d) { return d && Object.keys(d).some(function (k) { return d[k] && String(d[k]).trim(); }); }));
       case "reframe": return !!(v && (v.resonate || v.doubt || v.mine));
       case "digest": return !!(v && Object.keys(v).some(function (k) { return v[k] && String(v[k]).trim(); }));
       case "journey": return !!(v && ((v.v && v.v.some(function (x) { return x; })) || v.where || v.surprise));
       case "commit": return !!(v && (v.what || v.why));
       case "progress": return !!(v && (v.done || v.note));
-      case "manifest": return !!(v && String(v).trim());
+      case "manifest": return !!(typeof v === "string" && v.trim());
       case "ikigai": return !!(v && (v.like || v.good || v.need || v.paid || v.center));
       case "priority": return !!(v && ((v.order && v.order.some(function (x) { return x && String(x).trim(); })) || (v.why && v.why.trim())));
       case "odyssey": return !!(v && v.plans && v.plans.some(function (p) { return p.t || p.b; }));
@@ -286,7 +338,7 @@
     var hint = s.hint ? '<p class="hint">' + esc(s.hint) + "</p>" : "";
     var mx = s.max || 0;
     var chip = function (o, on) {
-      return '<button class="chip' + (on ? " on" : "") + '" onclick="toggleChoice(\'' + s.id + "','" + esc(o).replace(/'/g, "") + "',this," + (s.multi ? "true" : "false") + "," + mx + ')">' + esc(o) + "</button>";
+      return '<button class="chip' + (on ? " on" : "") + '" onclick="toggleChoice(\'' + s.id + "','" + jstr(o) + "',this," + (s.multi ? "true" : "false") + "," + mx + ')">' + esc(o) + "</button>";
     };
     var chips = s.options.map(function (o) { return chip(o, picked.indexOf(o) >= 0); }).join("");
     var customChips = picked.filter(function (p) { return s.options.indexOf(p) < 0; })
@@ -307,7 +359,7 @@
     }
     var chips = pool.map(function (w) {
       var on = sel.indexOf(w) >= 0 ? " on" : "";
-      return '<button class="chip' + on + '" onclick="cardToggle(\'' + s.id + "','" + w + "',this)\">" + esc(w) + "</button>";
+      return '<button class="chip' + on + '" onclick="cardToggle(\'' + s.id + "','" + jstr(w) + "',this)\">" + esc(w) + "</button>";
     }).join("");
     var cap = c.stage === 1 ? s.pick1 : s.pick2;
     var cntTxt = cap ? (sel.length + " / " + cap) : (sel.length + "개 선택");
@@ -352,7 +404,7 @@
       var chips = scale.map(function (lbl, idx) {
         var score = (idx + 1) * 2;
         var on = (cur === score) ? " on" : "";
-        return '<button class="chip' + on + '" onclick="setAssess(\'' + s.id + "','" + esc(a.label).replace(/'/g, "") + "'," + score + ',this)">' + esc(lbl) + "</button>";
+        return '<button class="chip' + on + '" onclick="setAssess(\'' + s.id + "','" + jstr(a.label) + "'," + score + ',this)">' + esc(lbl) + "</button>";
       }).join("");
       return '<div class="assessrow"><p class="alabel"><b>' + esc(a.label) + "</b> · " + esc(a.q) + '</p><div class="chips">' + chips + "</div></div>";
     }).join("");
@@ -403,9 +455,9 @@
     var parsed = parseBig5(text, doms);
     A[id] = { raw: text, domains: parsed.domains, facets: parsed.facets };
     save();
-    renderStep();
+    renderStep(true);
   };
-  window.clearBig5 = function (id) { A[id] = { raw: "", domains: {}, facets: {} }; save(); renderStep(); };
+  window.clearBig5 = function (id) { A[id] = { raw: "", domains: {}, facets: {} }; save(); renderStep(true); };
   var B5_LVL_KO = { high: "높음", low: "낮음", neutral: "중간" };
   function compBig5(s) {
     var d = big5Data(s.id);
@@ -484,7 +536,7 @@
       if (!sh.length) return "";
       var chips = sh.map(function (x) {
         var on = sel.indexOf(x) >= 0 ? " on" : "";
-        return '<button class="chip' + on + '" onclick="toggleChoice(\'' + s.id + "','" + esc(x).replace(/'/g, "") + "',this,true," + mx + ')">' + esc(x) + "</button>";
+        return '<button class="chip' + on + '" onclick="toggleChoice(\'' + s.id + "','" + jstr(x) + "',this,true," + mx + ')">' + esc(x) + "</button>";
       }).join("");
       return '<div class="shadowrow"><span class="slabel">' + esc(w) + ' →</span><div class="chips">' + chips + "</div></div>";
     }).join("");
@@ -504,7 +556,7 @@
     var val = (el.value || "").trim(); if (!val) return;
     var o = pstr(id), c = o[key];
     if (!c || !Array.isArray(c.picked)) { c = { picked: [], other: "" }; o[key] = c; }
-    if (c.picked.indexOf(val) < 0) c.picked.push(val); save(); el.value = ""; renderStep();
+    if (c.picked.indexOf(val) < 0) c.picked.push(val); save(); el.value = ""; renderStep(true);
   };
   function compByStrength(s) {
     var picks = selOf(s.strengthsFrom);
@@ -512,7 +564,7 @@
     if (!picks.length) return hint + '<p class="hint">' + esc(s.emptyHint || "먼저 강점을 골라주세요.") + "</p>";
     var o = pstr(s.id), mx = s.max || 0;
     var rows = picks.map(function (w) {
-      var key = esc(w).replace(/'/g, "");
+      var key = jstr(w); // JS 문자열 이스케이프 — 런타임에 원래 w로 복원되어 o[w] 조회와 일치
       if (s.mode === "text") {
         var val = (typeof o[w] === "string") ? o[w] : "";
         return '<div class="bsrow"><span class="slabel">' + esc(w) + "</span>" +
@@ -521,7 +573,7 @@
       }
       var c = (o[w] && Array.isArray(o[w].picked)) ? o[w] : { picked: [], other: "" };
       var chip = function (opt, on) {
-        return '<button class="chip' + (on ? " on" : "") + '" onclick="toggleStrengthChip(\'' + s.id + "','" + key + "','" + esc(opt).replace(/'/g, "") + "',this," + mx + ')">' + esc(opt) + "</button>";
+        return '<button class="chip' + (on ? " on" : "") + '" onclick="toggleStrengthChip(\'' + s.id + "','" + key + "','" + jstr(opt) + "',this," + mx + ')">' + esc(opt) + "</button>";
       };
       var chips = (s.options || []).map(function (opt) { return chip(opt, c.picked.indexOf(opt) >= 0); }).join("");
       var custom = c.picked.filter(function (p) { return (s.options || []).indexOf(p) < 0; }).map(function (p) { return chip(p, true); }).join("");
@@ -553,7 +605,7 @@
   }
   function gapTop(nowId, wantId, n) {
     var now = A[nowId] || {}, want = A[wantId] || {};
-    var src = (getWeek("w4").steps.filter(function (x) { return x.id === nowId; })[0] || {});
+    var src = ((getWeek("w4") || { steps: [] }).steps.filter(function (x) { return x.id === nowId; })[0] || {});
     var areas = src.areas || [];
     var g = areas.map(function (a) {
       var nv = now[a.label], wv = want[a.label];
@@ -644,6 +696,7 @@
   function compPromptForge(s) {
     var intro = s.intro ? '<p class="hint">' + esc(s.intro) + "</p>" : "";
     var out = intro +
+      '<p class="hint">붙여넣기 전에, AI에 보내고 싶지 않은 내용은 지우고 붙여도 괜찮아요.</p>' +
       '<textarea class="promptbox" rows="10" readonly>' + esc(buildPrompt(s)) + "</textarea>" +
       '<div class="rowbtn"><button class="btn" onclick="copyPrompt(this)">프롬프트 복사</button> ' +
       '<a class="btn ghost" href="https://claude.ai/new" target="_blank" rel="noopener">Claude 열기</a> ' +
@@ -765,32 +818,53 @@
   }
 
   /* 가치 우선순위 */
+  function priorityFilled(p) { return p.order.some(function (x) { return x && String(x).trim(); }); }
   function priorityData(id) {
     if (!A[id]) A[id] = { order: [], why: "" };
     var p = A[id];
-    if (!p.order || !p.order.length) {
-      var src = (A.w1_journey && A.w1_journey.v) ? A.w1_journey.v.filter(function (x) { return x && x.trim(); }) : [];
+    if (!Array.isArray(p.order)) p.order = [];
+    if (!priorityFilled(p)) {
+      var src = (A.w1_journey && Array.isArray(A.w1_journey.v)) ? A.w1_journey.v.filter(function (x) { return x && x.trim(); }) : [];
       p.order = src.slice();
+      p.editing = !src.length;
     }
     return p;
   }
-  window.setPriorityWhy = function (id, v) { if (!A[id]) A[id] = { order: [], why: "" }; A[id].why = v; save(); };
-  window.setPriorityItem = function (id, i, v) { if (!A[id]) A[id] = { order: [], why: "" }; A[id].order[i] = v; save(); };
+  window.setPriorityWhy = function (id, v) { priorityData(id).why = v; save(); };
+  window.setPriorityItem = function (id, i, v) {
+    var p = priorityData(id);
+    while (p.order.length < 5) p.order.push("");
+    p.order[i] = v; save();
+  };
+  window.priorityDone = function (id) {
+    var p = priorityData(id);
+    p.order = p.order.filter(function (x) { return x && String(x).trim(); });
+    p.editing = false; save(); renderStep(true);
+  };
+  window.priorityEdit = function (id) {
+    var p = priorityData(id);
+    while (p.order.length < 5) p.order.push("");
+    p.editing = true; save(); renderStep(true);
+  };
   window.movePriority = function (id, i, dir) {
     var p = A[id]; if (!p || !p.order) return;
     var j = i + dir; if (j < 0 || j >= p.order.length) return;
     var t = p.order[i]; p.order[i] = p.order[j]; p.order[j] = t;
-    save(); renderStep();
+    save(); renderStep(true);
   };
   function compPriority(s) {
     var p = priorityData(s.id);
     var hint = s.hint ? '<p class="hint">' + esc(s.hint) + "</p>" : "";
-    if (!p.order.length) {
+    var filled = priorityFilled(p);
+    if (p.editing || !filled) {
+      while (p.order.length < 5) p.order.push("");
       var blanks = "";
       for (var k = 0; k < 5; k++) {
         blanks += '<input type="text" class="jval" placeholder="가치 ' + (k + 1) + '" value="' + esc(p.order[k] || "") + '" oninput="setPriorityItem(\'' + s.id + "'," + k + ',this.value)">';
       }
-      return hint + '<p class="hint">아직 가치 여정 결과가 없네요. 지금 중요한 가치를 직접 적어도 돼요.</p><div class="jvals">' + blanks + "</div>";
+      var guide = filled ? "" : '<p class="hint">아직 가치 여정 결과가 없네요. 지금 중요한 가치를 직접 적어도 돼요.</p>';
+      return hint + guide + '<div class="jvals">' + blanks + "</div>" +
+        '<div class="rowbtn"><button class="btn" onclick="priorityDone(\'' + s.id + '\')">이 가치들로 순위 정하기 →</button></div>';
     }
     var rows = p.order.map(function (val, i) {
       var up = i === 0 ? '<span class="prbtn ghost">·</span>' : '<button class="prbtn" onclick="movePriority(\'' + s.id + "'," + i + ',-1)">↑</button>';
@@ -799,6 +873,7 @@
         '<span class="prctl">' + up + down + "</span></div>";
     }).join("");
     return hint + '<div class="priority">' + rows + "</div>" +
+      '<div class="rowbtn"><button class="btn ghost" onclick="priorityEdit(\'' + s.id + '\')">가치 다시 쓰기</button></div>' +
       '<label class="rfield"><span>1순위가 왜 먼저인가요?</span><textarea rows="2" oninput="setPriorityWhy(\'' + s.id + '\',this.value)">' + esc(p.why || "") + "</textarea></label>";
   }
 
@@ -855,6 +930,15 @@
       return '<div class="wcard locked"><div class="wbadge">' + esc(l.badge) + "</div><h3>" + esc(l.title) + "</h3><p>" + esc(l.desc) + "</p></div>";
     }).join("");
     var promises = COURSE.promises.map(function (p) { return "<li>" + esc(p) + "</li>"; }).join("");
+    var backupBanner = "";
+    if (Object.keys(A).length) {
+      var t = state.backupAt ? Date.parse(state.backupAt) : 0;
+      if (!t || Date.now() - t > 7 * 24 * 60 * 60 * 1000) {
+        backupBanner = '<div class="warnband">' +
+          (t ? "마지막 백업을 받은 지 7일이 넘었어요." : "아직 백업 파일이 없어요.") +
+          " 브라우저는 오래 안 쓴 저장 공간을 지우기도 해요 — 아래에서 한 번 백업해 두세요.</div>";
+      }
+    }
     document.getElementById("app").innerHTML =
       '<section class="home">' +
       '<div class="hero"><h1>' + esc(COURSE.title) + "</h1><p>" + esc(COURSE.subtitle) + "</p></div>" +
@@ -862,8 +946,9 @@
       '<div class="promises"><ul>' + promises + "</ul></div>" +
       '<div class="wgrid">' + cards + locked + "</div>" +
       '<div class="rowbtn center"><a class="btn big" href="#book">내 책 미리보기 →</a></div>' +
+      backupBanner +
       '<div class="backup">' +
-      '<p class="backup-note">쓰는 즉시 자동 저장돼요. 폰을 바꾸거나 브라우저를 정리하기 전엔 한 번 백업을 받아두면 안전해요. (친구들은 각자 자기 기기에서 각자 받으면 돼요)</p>' +
+      '<p class="backup-note">쓰는 즉시 자동 저장돼요. 폰을 바꾸거나 브라우저를 정리하기 전엔 한 번 백업을 받아두면 안전해요. (친구들은 각자 자기 기기에서 각자 받으면 돼요)<br>여럿이 쓰는 기기에서는 기록이 그 브라우저에 남으니, 개인 기기에서 쓰는 걸 추천해요.</p>' +
       '<div class="rowbtn center"><button class="btn ghost" onclick="exportData()">내 기록 백업하기</button> ' +
       '<button class="btn ghost" onclick="document.getElementById(\'importFile\').click()">백업 불러오기</button></div>' +
       '<input type="file" id="importFile" accept="application/json,.json" style="display:none" onchange="importData(this)">' +
@@ -873,7 +958,8 @@
     window.scrollTo(0, 0);
   }
 
-  function renderStep() {
+  function renderStep(keepScroll) {
+    var scrollY = keepScroll ? (window.scrollY || window.pageYOffset || 0) : 0;
     var week = getWeek(CUR.weekId);
     if (!week) { location.hash = "#home"; return; }
     if (!weekVisible(week)) { location.hash = "#home"; return; }
@@ -934,7 +1020,7 @@
       '<a class="btn" href="' + nextHref + '">' + nextLabel + "</a></div>" +
       (isLast ? '<div class="rowbtn center"><a class="btn big" href="#book">내 책 미리보기 →</a></div>' : "") +
       "</section>";
-    window.scrollTo(0, 0);
+    window.scrollTo(0, keepScroll ? scrollY : 0);
   }
 
   /* ---------- 내 책 ---------- */
@@ -980,7 +1066,13 @@
     var author = (A.author && A.author.trim()) || "나";
     var vals5 = (A.w1_journey && A.w1_journey.v) ? A.w1_journey.v.filter(function (x) { return x; }).join(" · ") : "";
     var radarVals = A.w4_areas || {};
-    var areaItems = getWeek("w4").steps.filter(function (s) { return s.type === "assess"; })[0].areas.map(function (a) { return a.label; });
+    var w4wk = getWeek("w4");
+    var areaStep = w4wk ? w4wk.steps.filter(function (s) { return s.type === "assess"; })[0] : null;
+    var areaItems = areaStep ? areaStep.areas.map(function (a) { return a.label; }) : [];
+    var hasRadar = areaItems.length && (Object.keys(radarVals).length || (A.w4_want && Object.keys(A.w4_want).length));
+    var radarHtml = hasRadar
+      ? '<svg class="radar" viewBox="0 0 220 220">' + radarInner(areaItems, radarVals, A.w4_want || null) + '</svg><p class="gaplegend"><span class="gk now">지금</span> <span class="gk want">바람</span></p>'
+      : '<p class="empty">아직 비어 있어요</p>';
     var html =
       '<section class="book">' +
       '<div class="noprint bookbar"><a class="btn ghost" href="#home">← 홈</a><button class="btn" onclick="window.print()">PDF로 저장 / 인쇄</button></div>' +
@@ -1027,7 +1119,7 @@
       bookBlock("AI와 곱씹어 다시 쓴 강점", (A.w3_reframe && A.w3_reframe.mine) || "") + "</div>" +
 
       '<div class="chapter ch4">' + chapHead("2부", "나의 현재 지도", STK.cloud) +
-      '<div class="bq"><h4>지금 / 바라는 내 삶의 영역</h4><svg class="radar" viewBox="0 0 220 220">' + radarInner(areaItems, radarVals, A.w4_want || null) + '</svg><p class="gaplegend"><span class="gk now">지금</span> <span class="gk want">바람</span></p></div>' +
+      '<div class="bq"><h4>지금 / 바라는 내 삶의 영역</h4>' + radarHtml + "</div>" +
       bookBlock("돈·경제 — 지금", fmtChoices("w4_money_now")) +
       bookBlock("건강·몸 — 지금", fmtChoices("w4_body_now")) +
       bookBlock("일·커리어 — 지금", fmtChoices("w4_work_now")) +
@@ -1108,16 +1200,23 @@
 
   /* ---------- 라우팅 ---------- */
   function route() {
-    var h = location.hash.replace(/^#/, "");
-    if (h === ADMIN_HASH) { try { localStorage.setItem("njz_admin", "1"); } catch (e) {} location.hash = "#home"; return; }
-    if (h === "book") { renderBook(); return; }
-    var m = h.match(/^(w\d+[a-z]*)\/(\d+)$/);
-    if (m) {
-      var wk = getWeek(m[1]);
-      if (wk && !weekVisible(wk)) { location.hash = "#home"; return; }
-      CUR.weekId = m[1]; CUR.idx = +m[2]; renderStep(); return;
+    try {
+      var h = location.hash.replace(/^#/, "");
+      if (h === ADMIN_HASH) { try { localStorage.setItem("njz_admin", "1"); } catch (e) {} location.hash = "#home"; return; }
+      if (h === "book") { renderBook(); return; }
+      var m = h.match(/^(w\d+[a-z]*)\/(\d+)$/);
+      if (m) {
+        var wk = getWeek(m[1]);
+        if (wk && !weekVisible(wk)) { location.hash = "#home"; return; }
+        CUR.weekId = m[1]; CUR.idx = +m[2]; renderStep(); return;
+      }
+      renderHome();
+    } catch (e) {
+      document.getElementById("app").innerHTML =
+        '<section class="step"><h2>화면을 그리다 잠깐 문제가 생겼어요</h2>' +
+        '<p class="hint">기록은 그대로 남아 있어요. 홈으로 돌아가 보고, 같은 문제가 반복되면 백업을 먼저 받아두세요.</p>' +
+        '<div class="rowbtn"><a class="btn" href="#home">홈으로</a> <button class="btn ghost" onclick="exportData()">내 기록 백업하기</button></div></section>';
     }
-    renderHome();
   }
   window.addEventListener("hashchange", route);
   route();
